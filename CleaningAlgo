@@ -1,0 +1,194 @@
+import numpy as np
+import pandas as pd
+from typing import Union, Tuple
+
+def clean_price_spikes(data: Union[list, np.ndarray, pd.Series], 
+                      spike_threshold: float = 2.0,
+                      lookback_window: int = 5,
+                      reversal_threshold: float = 0.7,
+                      min_spike_size: float = None) -> Union[np.ndarray, pd.Series]:
+    """
+    Clean time series data by removing spike-reversal patterns.
+    
+    Parameters:
+    -----------
+    data : array-like
+        Time series of price differences (minute by minute)
+    spike_threshold : float, default=2.0
+        Number of standard deviations to consider a "big jump"
+    lookback_window : int, default=5
+        Number of periods to look ahead for reversal pattern
+    reversal_threshold : float, default=0.7
+        Fraction of original spike that constitutes a "similar jump in opposite direction"
+        (0.7 means reversal needs to be at least 70% of original spike magnitude)
+    min_spike_size : float, optional
+        Absolute minimum size for considering something a spike
+        If None, uses only the statistical threshold
+    
+    Returns:
+    --------
+    Cleaned data with spikes replaced by interpolated values
+    """
+    
+    # Convert to numpy array for processing
+    if isinstance(data, pd.Series):
+        is_series = True
+        index = data.index
+        values = data.values.copy()
+    else:
+        is_series = False
+        values = np.array(data).copy()
+    
+    # Calculate rolling statistics for spike detection
+    window_size = min(20, len(values) // 4)  # Adaptive window size
+    rolling_std = pd.Series(values).rolling(window=window_size, min_periods=1).std()
+    rolling_mean = pd.Series(values).rolling(window=window_size, min_periods=1).mean()
+    
+    # Identify potential spikes
+    spike_indices = []
+    
+    for i in range(len(values) - 1):
+        current_val = values[i]
+        
+        # Check if current value is a spike
+        is_statistical_spike = abs(current_val - rolling_mean.iloc[i]) > spike_threshold * rolling_std.iloc[i]
+        is_absolute_spike = min_spike_size is None or abs(current_val) > min_spike_size
+        
+        if is_statistical_spike and is_absolute_spike:
+            # Look for reversal in the next few periods
+            reversal_found = False
+            
+            for j in range(1, min(lookback_window + 1, len(values) - i)):
+                future_val = values[i + j]
+                
+                # Check if future value is a reversal (opposite direction, similar magnitude)
+                if (current_val > 0 and future_val < 0) or (current_val < 0 and future_val > 0):
+                    reversal_magnitude = abs(future_val) / abs(current_val)
+                    
+                    if reversal_magnitude >= reversal_threshold:
+                        spike_indices.append((i, i + j))  # Store both spike and reversal indices
+                        reversal_found = True
+                        break
+            
+            # Also check for accumulated reversal (multiple small moves in opposite direction)
+            if not reversal_found:
+                cumulative_reversal = 0
+                for j in range(1, min(lookback_window + 1, len(values) - i)):
+                    if (current_val > 0 and values[i + j] < 0) or (current_val < 0 and values[i + j] > 0):
+                        cumulative_reversal += abs(values[i + j])
+                        
+                        if cumulative_reversal / abs(current_val) >= reversal_threshold:
+                            spike_indices.append((i, i + j))
+                            break
+    
+    # Remove overlapping spike patterns (keep the first one found)
+    cleaned_spikes = []
+    used_indices = set()
+    
+    for spike_start, spike_end in spike_indices:
+        if spike_start not in used_indices and spike_end not in used_indices:
+            cleaned_spikes.append((spike_start, spike_end))
+            used_indices.update(range(spike_start, spike_end + 1))
+    
+    print(f"Found {len(cleaned_spikes)} spike-reversal patterns to clean")
+    
+    # Replace spike patterns with interpolated values
+    cleaned_values = values.copy()
+    
+    for spike_start, spike_end in cleaned_spikes:
+        # Get surrounding values for interpolation
+        before_idx = max(0, spike_start - 1)
+        after_idx = min(len(values) - 1, spike_end + 1)
+        
+        if before_idx == spike_start:  # At beginning of series
+            replacement = cleaned_values[after_idx]
+        elif after_idx == spike_end:  # At end of series
+            replacement = cleaned_values[before_idx]
+        else:  # Interpolate
+            before_val = cleaned_values[before_idx]
+            after_val = cleaned_values[after_idx]
+            n_points = spike_end - spike_start + 1
+            
+            # Linear interpolation
+            interp_values = np.linspace(before_val, after_val, n_points + 2)[1:-1]
+            cleaned_values[spike_start:spike_end + 1] = interp_values
+    
+    # Return in original format
+    if is_series:
+        return pd.Series(cleaned_values, index=index)
+    else:
+        return cleaned_values
+
+
+def analyze_spikes(data: Union[list, np.ndarray, pd.Series],
+                  spike_threshold: float = 2.0,
+                  lookback_window: int = 5) -> dict:
+    """
+    Analyze spike patterns in the data without cleaning.
+    Useful for parameter tuning.
+    """
+    
+    values = np.array(data) if not isinstance(data, np.ndarray) else data
+    window_size = min(20, len(values) // 4)
+    rolling_std = pd.Series(values).rolling(window=window_size, min_periods=1).std()
+    rolling_mean = pd.Series(values).rolling(window=window_size, min_periods=1).mean()
+    
+    spikes = []
+    reversals = []
+    
+    for i in range(len(values) - 1):
+        current_val = values[i]
+        is_spike = abs(current_val - rolling_mean.iloc[i]) > spike_threshold * rolling_std.iloc[i]
+        
+        if is_spike:
+            spikes.append((i, current_val))
+            
+            # Look for reversal
+            for j in range(1, min(lookback_window + 1, len(values) - i)):
+                future_val = values[i + j]
+                if (current_val > 0 and future_val < 0) or (current_val < 0 and future_val > 0):
+                    reversals.append((i, i + j, current_val, future_val))
+                    break
+    
+    return {
+        'total_spikes': len(spikes),
+        'spikes_with_reversals': len(reversals),
+        'reversal_rate': len(reversals) / len(spikes) if spikes else 0,
+        'spike_details': spikes[:10],  # First 10 for inspection
+        'reversal_details': reversals[:10]
+    }
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Generate sample data with artificial spikes
+    np.random.seed(42)
+    n_points = 200
+    base_data = np.random.normal(0, 1, n_points)
+    
+    # Add some spike-reversal patterns
+    base_data[50] = 8    # Big positive spike
+    base_data[52] = -6   # Reversal 2 periods later
+    
+    base_data[100] = -5  # Big negative spike  
+    base_data[101] = 4   # Quick reversal
+    
+    base_data[150] = 10  # Another spike
+    base_data[153] = -7  # Reversal 3 periods later
+    
+    print("Original data analysis:")
+    analysis = analyze_spikes(base_data)
+    print(f"Total spikes: {analysis['total_spikes']}")
+    print(f"Spikes with reversals: {analysis['spikes_with_reversals']}")
+    print(f"Reversal rate: {analysis['reversal_rate']:.2%}")
+    
+    # Clean the data
+    cleaned_data = clean_price_spikes(base_data, 
+                                    spike_threshold=2.0,
+                                    lookback_window=5,
+                                    reversal_threshold=0.6)
+    
+    print(f"\nCleaning summary:")
+    print(f"Original std: {np.std(base_data):.3f}")
+    print(f"Cleaned std: {np.std(cleaned_data):.3f}")
+    print(f"Reduction in volatility: {(1 - np.std(cleaned_data)/np.std(base_data)):.1%}")
